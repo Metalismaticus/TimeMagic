@@ -9,7 +9,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.client.default import DefaultBotProperties
 
 # === Путь к корню проекта и загрузка конфига ===
@@ -55,7 +60,6 @@ if not BOT_TOKEN:
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-# aiogram 3.7+: parse_mode через DefaultBotProperties
 bot = Bot(
     BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML"),
@@ -64,8 +68,11 @@ dp = Dispatcher()
 
 # === Регекс и константы ===
 
-TIME_REGEX = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
-DATE_REGEX = re.compile(r"\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b")
+TIME_REGEX = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")  # чистое время
+TIME_ANY_REGEX = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+DATE_REGEX = re.compile(
+    r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b"
+)
 
 WEEKDAY_IN_TEXT_PATTERN = re.compile(
     r"\bво?\s+("
@@ -87,13 +94,15 @@ TIME_WORDS_EVENT = (
     "пн", "вт", "ср", "чт", "пт", "сб", "вс",
 )
 
+# pending конфликты: user_id -> {day:str, title:str, duration:int}
+PENDING_CONFLICTS: dict[str, dict] = {}
 
 # === Хелперы ===
 
 
 def has_explicit_date_or_time(text: str) -> bool:
     t = text.lower()
-    if TIME_REGEX.search(t):
+    if TIME_ANY_REGEX.search(t):
         return True
     if DATE_REGEX.search(t):
         return True
@@ -122,7 +131,6 @@ def is_end_of_day(dt: datetime) -> bool:
 
 
 def is_default_morning(dt: datetime) -> bool:
-    # Авто-время для "просто указан день"
     return dt.hour == 10 and dt.minute == 0 and dt.second == 0
 
 
@@ -131,40 +139,44 @@ def strip_weekday_phrase(text: str, default_label: str = "Задача") -> str:
     return clean or default_label
 
 
-def replace_weekday_with_date(text: str, dt: datetime) -> str:
-    return WEEKDAY_IN_TEXT_PATTERN.sub(format_date_ru(dt), text, count=1)
-
-
-def format_timed_line(base: str, dt: datetime | None) -> str:
+def clean_for_reschedule(text: str) -> str:
     """
-    Слот со временем:
-    - убираем 'в/во понедельник/...' из текста,
-    - если есть HH:MM в тексте, используем его,
-    - иначе используем dt,
-    - формат: '📆 <b>HH:MM</b> текст'.
+    Очищаем заголовок для повторного планирования:
+    убираем дни недели, даты, время и висящее 'в'.
+    """
+    b = (text or "").strip()
+    b = WEEKDAY_IN_TEXT_PATTERN.sub("", b)
+    b = DATE_REGEX.sub("", b)
+    b = TIME_ANY_REGEX.sub("", b)
+    b = re.sub(r"\bв$", "", b)
+    b = b.strip(" ,.-")
+    return b or "Без названия"
+
+
+def format_timed_line(base: str, start_dt: datetime | None, end_dt: datetime | None) -> str:
+    """
+    Слот:
+      📆 16:00-18:00 текст
+    без дат и дней недели внутри текста.
     """
     b = (base or "").strip() or "Без названия"
-    b = strip_weekday_phrase(b, default_label="Без названия")
 
-    # Явное время в тексте
-    m = TIME_REGEX.search(b)
-    if m:
-        time_str = m.group(0)
-        before = b[:m.start()]
-        after = b[m.end():]
-        text_clean = (before + after).strip(" ,.-")
-        # убрать висящий предлог "в" в конце
-        text_clean = re.sub(r"\bв$", "", text_clean).strip(" ,.-")
-        if not text_clean:
-            text_clean = "Без названия"
-        return f"📆 <b>{time_str}</b> {text_clean}"
+    b = WEEKDAY_IN_TEXT_PATTERN.sub("", b).strip(" ,.-")
+    b = DATE_REGEX.sub("", b).strip(" ,.-")
+    b = TIME_ANY_REGEX.sub("", b).strip(" ,.-")
+    b = re.sub(r"\bв$", "", b).strip(" ,.-")
+    if not b:
+        b = "Без названия"
 
-    # Время только из dt
-    if dt is not None:
-        time_str = dt.strftime("%H:%M")
-        return f"📆 <b>{time_str}</b> {b}"
+    if not start_dt:
+        return f"📆 {b}"
 
-    return f"📆 {b}"
+    if end_dt and end_dt > start_dt:
+        label = f"{start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}"
+    else:
+        label = start_dt.strftime("%H:%M")
+
+    return f"📆 <b>{label}</b> {b}"
 
 
 def format_event_reminder(title: str, start_dt: datetime) -> str:
@@ -188,31 +200,30 @@ def format_task_reminder(title: str, due_dt: datetime) -> str:
 
 def split_items_for_day(events, tasks, day_start: datetime, day_end: datetime):
     """
-    На один день:
-    - timed: всё с реальным временем,
-    - day_tasks: всё "на день" без времени.
+    events: (title, start_at, end_at)
+    tasks: (title, due_at)
     """
     timed: list[str] = []
     day_tasks: list[str] = []
 
     # События
-    for title, start_at in events:
+    for title, start_at, end_at in events:
         if not start_at:
             continue
         try:
-            dt = datetime.fromisoformat(start_at)
+            sdt = datetime.fromisoformat(start_at)
+            edt = datetime.fromisoformat(end_at) if end_at else None
         except Exception:
             continue
-        if not (day_start <= dt < day_end):
+        if not (day_start <= sdt < day_end):
             continue
 
         base = (title or "").strip() or "Без названия"
 
-        # Авто 10:00 без явного времени → задача на день
-        if is_default_morning(dt) and not has_explicit_date_or_time(base):
+        if is_default_morning(sdt) and not has_explicit_date_or_time(base):
             day_tasks.append(strip_weekday_phrase(base, default_label="Запись"))
         else:
-            timed.append(format_timed_line(base, dt))
+            timed.append(format_timed_line(base, sdt, edt))
 
     # Задачи
     for title, due_at in tasks:
@@ -226,22 +237,17 @@ def split_items_for_day(events, tasks, day_start: datetime, day_end: datetime):
         if not (day_start <= dt < day_end):
             continue
 
-        # Не конец дня → конкретное время
         if not is_end_of_day(dt):
-            timed.append(format_timed_line(base, dt))
+            timed.append(format_timed_line(base, dt, None))
             continue
 
-        # Конец дня:
-        # если в тексте есть HH:MM → слот
-        if TIME_REGEX.search(base):
-            timed.append(format_timed_line(base, None))
+        if TIME_ANY_REGEX.search(base):
+            timed.append(format_timed_line(base, None, None))
         else:
-            # Настоящая задача на день (из "в среду сделать ...")
             day_tasks.append(strip_weekday_phrase(base, default_label="Задача"))
 
-    # сортировка timed по времени
     def extract_time_prefix(s: str):
-        m = TIME_REGEX.search(s)
+        m = TIME_ANY_REGEX.search(s)
         if m:
             try:
                 h = int(m.group(1))
@@ -255,12 +261,11 @@ def split_items_for_day(events, tasks, day_start: datetime, day_end: datetime):
     return timed_sorted, day_tasks
 
 
-# === Сводка на сегодня ===
+# === Сводки ===
 
 
-def build_today_summary_text(user_id: str) -> str | None:
-    now = datetime.now()
-    day_start = datetime(now.year, now.month, now.day, 0, 0, 0)
+def build_day_plan_text(user_id: str, day: datetime.date) -> str:
+    day_start = datetime(day.year, day.month, day.day, 0, 0, 0)
     day_end = day_start + timedelta(days=1)
 
     conn = get_conn()
@@ -268,12 +273,13 @@ def build_today_summary_text(user_id: str) -> str | None:
 
     cur.execute(
         """
-        SELECT title, start_at FROM items
+        SELECT title, start_at, end_at FROM items
         WHERE user_id = ?
           AND type = 'event'
           AND start_at IS NOT NULL
           AND start_at >= ?
           AND start_at < ?
+        ORDER BY start_at
         """,
         (user_id, day_start.isoformat(), day_end.isoformat()),
     )
@@ -288,6 +294,7 @@ def build_today_summary_text(user_id: str) -> str | None:
           AND due_at IS NOT NULL
           AND due_at >= ?
           AND due_at < ?
+        ORDER BY due_at
         """,
         (user_id, day_start.isoformat(), day_end.isoformat()),
     )
@@ -298,21 +305,28 @@ def build_today_summary_text(user_id: str) -> str | None:
     timed, day_tasks = split_items_for_day(events, tasks, day_start, day_end)
 
     if not timed and not day_tasks:
-        return None
+        return f"План на {format_date_ru(day_start)}: пусто."
 
-    lines = ["Сегодня:"]
+    lines = [f"План на {format_date_ru(day_start)}:"]
     for item in timed:
-        lines.append(f"- {item}")
-
+        lines.append(f"  {item}")
     if day_tasks:
-        lines.append("\n🧾 Задачи на день:")
+        lines.append("  🧾 Задачи на день:")
         for item in day_tasks:
-            lines.append(f"- {item}")
-
+            lines.append(f"    - {item}")
     return "\n".join(lines)
 
 
-# === Расписание на период (week/month) ===
+def build_today_summary_text(user_id: str) -> str | None:
+    now = datetime.now()
+    txt = build_day_plan_text(user_id, now.date())
+    if "пусто." in txt:
+        return None
+    lines = txt.splitlines()
+    if not lines:
+        return None
+    lines[0] = "Сегодня:"
+    return "\n".join(lines)
 
 
 def get_period_items(user_id: str, days: int):
@@ -325,7 +339,7 @@ def get_period_items(user_id: str, days: int):
 
     cur.execute(
         """
-        SELECT title, start_at FROM items
+        SELECT title, start_at, end_at FROM items
         WHERE user_id = ?
           AND type = 'event'
           AND start_at IS NOT NULL
@@ -370,8 +384,8 @@ def build_period_schedule_text(user_id: str, days: int, header: str) -> str:
         day_key = format_date_ru(day_start)
 
         day_events = [
-            (t, s)
-            for (t, s) in events
+            (t, s, e)
+            for (t, s, e) in events
             if s and day_start <= datetime.fromisoformat(s) < day_end
         ]
         day_tasks = [
@@ -399,6 +413,82 @@ def build_period_schedule_text(user_id: str, days: int, header: str) -> str:
                 lines.append(f"    - {item}")
 
     return "\n".join(lines)
+
+
+# === Конфликт: текст + кнопки ===
+
+
+def build_conflict_message(user_id: str, payload: str):
+    """
+    payload:
+      __CONFLICT__|day|conf_title|conf_start|conf_end|new_title|duration_min
+    """
+    parts = payload.split("|")
+    if len(parts) < 7:
+        text = "Не могу добавить: время занято."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="conf_help_cancel")]
+            ]
+        )
+        return text, kb, None
+
+    _, day_iso, conf_title, conf_start, conf_end, new_title, duration_str = parts
+
+    # duration_min может быть 0 (точка), не поднимаем до 30.
+    try:
+        duration_min = max(0, int(duration_str))
+    except Exception:
+        duration_min = 0
+
+    try:
+        day = datetime.fromisoformat(day_iso).date()
+    except Exception:
+        day = datetime.now().date()
+
+    conflict_line = "Не могу добавить: в это время уже есть другое событие."
+    try:
+        if conf_title and conf_start:
+            cs = datetime.fromisoformat(conf_start)
+            ce = datetime.fromisoformat(conf_end) if conf_end else cs
+            if ce > cs:
+                conflict_line = (
+                    f"Не могу добавить: в это время уже есть '{conf_title}' "
+                    f"({cs.strftime('%d.%m %H:%M')}-{ce.strftime('%H:%M')})."
+                )
+            else:
+                conflict_line = (
+                    f"Не могу добавить: в это время уже есть '{conf_title}' "
+                    f"({cs.strftime('%d.%m %H:%M')})."
+                )
+    except Exception:
+        pass
+
+    plan_text = build_day_plan_text(user_id, day)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏰ Указать другое время", callback_data="conf_help_time")],
+            [InlineKeyboardButton(text="📅 Выбрать другой день", callback_data="conf_help_day")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="conf_help_cancel")],
+        ]
+    )
+
+    text = (
+        f"{conflict_line}\n"
+        f"{plan_text}\n\n"
+        f"Выбери действие кнопкой ниже.\n"
+        f"При выборе времени введи только новое время.\n"
+        f"При выборе другой даты введи только дату или дату и время."
+    )
+
+    pending = {
+        "day": day_iso,
+        "title": clean_for_reschedule(new_title),
+        "duration": duration_min,
+    }
+
+    return text, kb, pending
 
 
 # === Команды ===
@@ -443,14 +533,6 @@ async def cmd_month(message: Message):
 
 @dp.message(Command("tasks"))
 async def cmd_tasks(message: Message):
-    """
-    Показывает:
-    - задачи без due_at;
-    - задачи с due_at в 23:59, без HH:MM и с явным 'до' (крайний срок).
-    Не показывает:
-    - задачи на конкретный день ('в среду сделать ...');
-    - задачи/события с конкретным временем.
-    """
     user_id = str(message.from_user.id)
     rows = storage.get_tasks(user_id)
     if not rows:
@@ -463,7 +545,6 @@ async def cmd_tasks(message: Message):
         base = (title or "").strip() or "Задача"
         lower = base.lower()
 
-        # Без дедлайна → оставить
         if not due_at:
             filtered.append((base, None))
             continue
@@ -471,24 +552,19 @@ async def cmd_tasks(message: Message):
         try:
             dt = datetime.fromisoformat(due_at)
         except Exception:
-            # странная дата: если есть 'до' и нет времени, считаем дедлайном
-            if "до " in lower and not TIME_REGEX.search(base):
+            if "до " in lower and not TIME_ANY_REGEX.search(base):
                 filtered.append((base, None))
             continue
 
-        # Если есть точное время в due_at → это слотовое, не сюда
         if not is_end_of_day(dt):
             continue
 
-        # Если в тексте есть HH:MM → тоже слотовое, не сюда
-        if TIME_REGEX.search(base):
+        if TIME_ANY_REGEX.search(base):
             continue
 
-        # Если это формулировка "в/во понедельник/..." без 'до' → задача на день, не сюда
         if WEEKDAY_IN_TEXT_PATTERN.search(base) and "до " not in lower:
             continue
 
-        # Остальное с 'до' считаем дедлайном
         if "до " in lower:
             filtered.append((base, dt))
 
@@ -522,17 +598,138 @@ async def cmd_notes(message: Message):
     await message.answer("\n".join(lines))
 
 
-# === Обработка произвольного текста ===
+# === Callback-и по конфликту ===
+
+
+@dp.callback_query(F.data == "conf_help_time")
+async def cb_conf_help_time(query: CallbackQuery):
+    user_id = str(query.from_user.id)
+    if user_id not in PENDING_CONFLICTS:
+        await query.answer()
+        await query.message.answer("Нет ожидающей встречи. Создай новую фразой.")
+        return
+    await query.answer()
+    await query.message.answer(
+        "Введи только новое время в формате HH:MM.\n"
+        "Описание и длительность возьму из последней конфликтной встречи."
+    )
+
+
+@dp.callback_query(F.data == "conf_help_day")
+async def cb_conf_help_day(query: CallbackQuery):
+    user_id = str(query.from_user.id)
+    if user_id not in PENDING_CONFLICTS:
+        await query.answer()
+        await query.message.answer("Нет ожидающей встречи. Создай новую фразой.")
+        return
+    await query.answer()
+    await query.message.answer(
+        "Введи новую дату или дату и время, например:\n"
+        "13.11\n"
+        "или\n"
+        "13.11 15:00\n"
+        "Описание и длительность возьму из последней конфликтной встречи."
+    )
+
+
+@dp.callback_query(F.data == "conf_help_cancel")
+async def cb_conf_help_cancel(query: CallbackQuery):
+    user_id = str(query.from_user.id)
+    PENDING_CONFLICTS.pop(user_id, None)
+    await query.answer()
+    await query.message.answer("Добавление встречи отменено.")
+
+
+# === Обработка текста ===
 
 
 @dp.message(F.text)
 async def handle_text(message: Message):
     user_id = str(message.from_user.id)
-    reply, _item = service.handle_input(user_id, message.text)
-    await message.answer(reply)
+    text = message.text.strip()
+
+    # режим разрешения конфликта
+    if user_id in PENDING_CONFLICTS:
+        pending = PENDING_CONFLICTS[user_id]
+        title = pending["title"]
+        duration_min = pending["duration"]
+        day_iso = pending["day"]
+
+        # 1) Только время HH:MM -> тот же день
+        if TIME_REGEX.fullmatch(text):
+            h, m = map(int, text.split(":"))
+            try:
+                day = datetime.fromisoformat(day_iso).date()
+            except Exception:
+                day = datetime.now().date()
+            start_dt = datetime(day.year, day.month, day.day, h, m)
+
+            if duration_min and duration_min > 0:
+                synth = f"{title} {start_dt.strftime('%d.%m.%Y %H:%M')} на {duration_min} минут"
+            else:
+                synth = f"{title} {start_dt.strftime('%d.%m.%Y %H:%M')}"
+
+            PENDING_CONFLICTS.pop(user_id, None)
+            reply, _item = service.handle_input(user_id, synth)
+            await message.answer(reply)
+            return
+
+        # 2) Дата + время одновременно
+        if DATE_REGEX.search(text) and TIME_ANY_REGEX.search(text):
+            if duration_min and duration_min > 0:
+                synth = f"{title} {text} на {duration_min} минут"
+            else:
+                synth = f"{title} {text}"
+            PENDING_CONFLICTS.pop(user_id, None)
+            reply, _item = service.handle_input(user_id, synth)
+            await message.answer(reply)
+            return
+
+        # 3) Только дата -> обновляем день, просим время
+        if DATE_REGEX.fullmatch(text):
+            try:
+                m = DATE_REGEX.fullmatch(text)
+                d = int(m.group(1))
+                mo = int(m.group(2))
+                if m.group(3):
+                    y_raw = int(m.group(3))
+                    y = 2000 + y_raw if y_raw < 100 else y_raw
+                else:
+                    now = datetime.now()
+                    y = now.year
+                new_day = datetime(y, mo, d).date()
+                pending["day"] = new_day.isoformat()
+                PENDING_CONFLICTS[user_id] = pending
+            except Exception:
+                PENDING_CONFLICTS.pop(user_id, None)
+                reply, _item = service.handle_input(user_id, text)
+                await message.answer(reply)
+                return
+
+            await message.answer(
+                "Дата принята. Теперь введи время в формате HH:MM для этой встречи."
+            )
+            return
+
+        # 4) Любой другой ввод -> выходим из режима и обрабатываем как новый запрос
+        PENDING_CONFLICTS.pop(user_id, None)
+        reply, _item = service.handle_input(user_id, text)
+        await message.answer(reply)
+        return
+
+    # обычный режим
+    reply, _item = service.handle_input(user_id, text)
+
+    if reply.startswith("__CONFLICT__|"):
+        text_out, kb, pending = build_conflict_message(user_id, reply)
+        if pending:
+            PENDING_CONFLICTS[user_id] = pending
+        await message.answer(text_out, reply_markup=kb)
+    else:
+        await message.answer(reply)
 
 
-# === Цикл напоминаний и утренний дайджест ===
+# === Напоминания + дайджест ===
 
 
 async def reminder_loop():
@@ -542,7 +739,7 @@ async def reminder_loop():
         try:
             now = datetime.now()
 
-            # Утренний дайджест
+            # утренний дайджест
             if DAILY_DIGEST_ENABLED:
                 digest_dt = now.replace(
                     hour=DAILY_DIGEST_HOUR,
@@ -570,7 +767,7 @@ async def reminder_loop():
             conn = get_conn()
             cur = conn.cursor()
 
-            # Напоминания по событиям
+            # события
             if EVENT_REMIND_BEFORE_MINUTES is not None:
                 cur.execute(
                     """
@@ -583,7 +780,7 @@ async def reminder_loop():
                     """
                 )
                 events = cur.fetchall()
-                for item_id, user_id, title, start_at in events:
+                for item_id, uid, title, start_at in events:
                     try:
                         start_dt = datetime.fromisoformat(start_at)
                     except Exception:
@@ -592,7 +789,7 @@ async def reminder_loop():
                     if 0 <= diff_min <= EVENT_REMIND_BEFORE_MINUTES:
                         text = format_event_reminder(title, start_dt)
                         try:
-                            await bot.send_message(int(user_id), text)
+                            await bot.send_message(int(uid), text)
                         except Exception as e:
                             logger.error("Ошибка отправки напоминания (событие): %s", e)
                         cur.execute(
@@ -600,7 +797,7 @@ async def reminder_loop():
                             (item_id,),
                         )
 
-            # Напоминания по задачам
+            # задачи
             if TASK_REMIND_BEFORE_MINUTES is not None:
                 cur.execute(
                     """
@@ -613,7 +810,7 @@ async def reminder_loop():
                     """
                 )
                 tasks = cur.fetchall()
-                for item_id, user_id, title, due_at in tasks:
+                for item_id, uid, title, due_at in tasks:
                     try:
                         due_dt = datetime.fromisoformat(due_at)
                     except Exception:
@@ -622,7 +819,7 @@ async def reminder_loop():
                     if 0 <= diff_min <= TASK_REMIND_BEFORE_MINUTES:
                         text = format_task_reminder(title, due_dt)
                         try:
-                            await bot.send_message(int(user_id), text)
+                            await bot.send_message(int(uid), text)
                         except Exception as e:
                             logger.error("Ошибка отправки напоминания (задача): %s", e)
                         cur.execute(
